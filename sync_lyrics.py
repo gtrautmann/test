@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Lyrics Sync Tool - Detects when each line is sung in the audio using Whisper.
-Generates a timestamps file that the video generator uses for perfect sync.
+Lyrics Sync Tool - Detects when each line is sung using Whisper word-level timestamps.
+Uses sequential word matching (not segment matching) for much better accuracy.
 
 Usage:
     python3 sync_lyrics.py --audio "I Will Stand in the Light.mp3"
+    python3 sync_lyrics.py --audio "I Will Stand in the Light.mp3" --model medium  (more accurate)
 
-This will create a file called 'timestamps.json' with the timing for each line.
-You can then edit timestamps.json to fine-tune any timing, and run:
+This creates 'timestamps.json'. You can edit it to fine-tune, then run:
     python3 generate_video_synced.py --audio "I Will Stand in the Light.mp3"
 
 Requirements:
@@ -18,10 +18,10 @@ Requirements:
 import argparse
 import json
 import os
-import sys
+import re
+import string
 
 LYRICS_LINES = [
-    # (section, line)
     ("Intro", "This fear is real"),
     ("Intro", "This night is long"),
     ("Intro", "But something deeper calls me on"),
@@ -110,123 +110,176 @@ LYRICS_LINES = [
 ]
 
 
-def fuzzy_match(whisper_text, lyric_text):
-    """Simple fuzzy matching between whisper output and expected lyrics."""
-    w = whisper_text.lower().strip().strip(".,!?'\"")
-    l = lyric_text.lower().strip().strip(".,!?'\"")
-
-    # Exact match
-    if w == l:
-        return 1.0
-
-    # Check if one contains the other
-    if w in l or l in w:
-        return 0.8
-
-    # Word overlap
-    w_words = set(w.split())
-    l_words = set(l.split())
-    if not l_words:
-        return 0.0
-    overlap = len(w_words & l_words) / len(l_words)
-    return overlap
+def clean_word(w):
+    """Normalize a word for matching."""
+    return re.sub(r'[^a-z\']', '', w.lower().strip())
 
 
-def align_whisper_to_lyrics(segments):
-    """Align Whisper segments to our known lyrics using fuzzy matching."""
+def extract_all_words(result):
+    """Extract every word with its timestamp from Whisper output."""
+    words = []
+    for seg in result["segments"]:
+        if "words" not in seg:
+            continue
+        for w in seg["words"]:
+            cleaned = clean_word(w["word"])
+            if cleaned:
+                words.append({
+                    "word": cleaned,
+                    "start": w["start"],
+                    "end": w["end"],
+                    "raw": w["word"].strip(),
+                })
+    return words
+
+
+def align_lyrics_to_words(whisper_words):
+    """
+    Sequentially align each lyric line to whisper words.
+    Walks through whisper words in order, matching each lyric line's words
+    in sequence. This ensures:
+    - Every lyric line gets a timestamp
+    - Lines are in the correct order
+    - Repeated lines (like chorus) get matched to the right occurrence
+    """
     timestamps = []
-    lyric_idx = 0
+    word_cursor = 0  # current position in whisper_words
 
-    # Combine all whisper words with their timestamps
-    whisper_lines = []
-    for seg in segments:
-        whisper_lines.append({
-            "text": seg["text"].strip(),
-            "start": seg["start"],
-            "end": seg["end"],
-        })
+    for section, lyric_text in LYRICS_LINES:
+        lyric_words = [clean_word(w) for w in lyric_text.split() if clean_word(w)]
 
-    # For each lyric line, find the best matching whisper segment
-    used_segments = set()
+        if not lyric_words:
+            continue
 
-    for lyric_idx, (section, lyric_text) in enumerate(LYRICS_LINES):
+        # Try to find these words starting from word_cursor
+        best_start_idx = None
+        best_end_idx = None
         best_score = 0
-        best_seg_idx = None
-        best_start = None
-        best_end = None
 
-        # Search through whisper segments
-        for si, seg in enumerate(whisper_lines):
-            if si in used_segments:
-                continue
-            score = fuzzy_match(seg["text"], lyric_text)
+        # Search window: from cursor to cursor + 200 words ahead
+        search_end = min(len(whisper_words), word_cursor + 300)
 
-            # Also try combining consecutive segments
-            if si + 1 < len(whisper_lines) and si + 1 not in used_segments:
-                combined = seg["text"] + " " + whisper_lines[si + 1]["text"]
-                combined_score = fuzzy_match(combined, lyric_text)
-                if combined_score > score:
-                    score = combined_score
+        for start_pos in range(word_cursor, search_end):
+            # Try to match lyric words starting at this position
+            matched = 0
+            last_matched_pos = start_pos
+            pos = start_pos
 
-            if score > best_score:
-                best_score = score
-                best_seg_idx = si
-                best_start = seg["start"]
-                best_end = seg["end"]
+            for lw in lyric_words:
+                # Look for this lyric word within a small window from current pos
+                found = False
+                for offset in range(0, 5):  # allow skipping up to 4 whisper words
+                    check_pos = pos + offset
+                    if check_pos >= len(whisper_words):
+                        break
+                    if whisper_words[check_pos]["word"] == lw:
+                        matched += 1
+                        last_matched_pos = check_pos
+                        pos = check_pos + 1
+                        found = True
+                        break
+                if not found:
+                    # Try fuzzy: check if whisper word starts with or contains lyric word
+                    for offset in range(0, 5):
+                        check_pos = pos + offset
+                        if check_pos >= len(whisper_words):
+                            break
+                        ww = whisper_words[check_pos]["word"]
+                        if lw in ww or ww in lw or (len(lw) > 3 and lw[:3] == ww[:3]):
+                            matched += 0.7
+                            last_matched_pos = check_pos
+                            pos = check_pos + 1
+                            found = True
+                            break
+                    if not found:
+                        pos += 1  # skip and continue
 
-        if best_score >= 0.3 and best_seg_idx is not None:
-            used_segments.add(best_seg_idx)
+            score = matched / len(lyric_words)
+
+            # Prefer matches closer to cursor (sequential order)
+            proximity_bonus = max(0, 1.0 - (start_pos - word_cursor) * 0.005)
+            adjusted_score = score * 0.7 + proximity_bonus * 0.3
+
+            if score >= 0.4 and adjusted_score > best_score:
+                best_score = adjusted_score
+                best_start_idx = start_pos
+                best_end_idx = last_matched_pos
+
+        if best_start_idx is not None and best_end_idx is not None:
+            start_time = whisper_words[best_start_idx]["start"]
+            end_time = whisper_words[best_end_idx]["end"]
+
             timestamps.append({
                 "section": section,
                 "text": lyric_text,
-                "start": round(best_start, 2),
-                "end": round(best_end, 2),
+                "start": round(start_time, 2),
+                "end": round(end_time, 2),
                 "confidence": round(best_score, 2),
             })
+
+            # Move cursor past the matched words
+            word_cursor = best_end_idx + 1
         else:
-            # No match found - will need manual timing
+            # Could not match - will interpolate later
             timestamps.append({
                 "section": section,
                 "text": lyric_text,
                 "start": None,
                 "end": None,
                 "confidence": 0,
-                "NOTE": "COULD NOT AUTO-DETECT - please set start/end manually",
             })
 
-    # Fill in gaps: interpolate missing timestamps
-    last_good_time = 0
-    for i, ts in enumerate(timestamps):
-        if ts["start"] is not None:
-            last_good_time = ts["start"]
-        else:
-            # Look ahead for next good timestamp
-            next_good_time = last_good_time + 3.0
-            for j in range(i + 1, len(timestamps)):
-                if timestamps[j]["start"] is not None:
-                    next_good_time = timestamps[j]["start"]
-                    break
-            # Count how many gaps
-            gap_count = 0
-            for j in range(i, len(timestamps)):
-                if timestamps[j]["start"] is None:
-                    gap_count += 1
-                else:
-                    break
-            # Interpolate
-            interval = (next_good_time - last_good_time) / (gap_count + 1)
-            ts["start"] = round(last_good_time + interval, 2)
-            ts["end"] = round(ts["start"] + 2.0, 2)
-            last_good_time = ts["start"]
+    # Interpolate any missing timestamps
+    _interpolate_gaps(timestamps)
 
     return timestamps
+
+
+def _interpolate_gaps(timestamps):
+    """Fill in missing timestamps by interpolating between known ones."""
+    # First pass: forward fill
+    last_end = 0.0
+    for i, ts in enumerate(timestamps):
+        if ts["start"] is not None:
+            last_end = ts["end"]
+            continue
+
+        # Find next known timestamp
+        next_start = last_end + 20.0  # fallback
+        for j in range(i + 1, len(timestamps)):
+            if timestamps[j]["start"] is not None:
+                next_start = timestamps[j]["start"]
+                break
+
+        # Count consecutive gaps
+        gap_count = 0
+        for j in range(i, len(timestamps)):
+            if timestamps[j]["start"] is None:
+                gap_count += 1
+            else:
+                break
+
+        # Distribute time evenly
+        gap_duration = next_start - last_end
+        interval = gap_duration / (gap_count + 1)
+
+        for j in range(gap_count):
+            idx = i + j
+            if timestamps[idx]["start"] is None:
+                timestamps[idx]["start"] = round(last_end + interval * (j + 1), 2)
+                timestamps[idx]["end"] = round(timestamps[idx]["start"] + min(interval * 0.8, 2.5), 2)
+                timestamps[idx]["confidence"] = 0.0
+                timestamps[idx]["interpolated"] = True
+
+        last_end = timestamps[i + gap_count - 1]["end"] if gap_count > 0 else last_end
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sync lyrics to audio using Whisper")
     parser.add_argument("--audio", type=str, required=True, help="Path to audio file")
     parser.add_argument("--output", type=str, default="timestamps.json", help="Output timestamps file")
-    parser.add_argument("--model", type=str, default="base", help="Whisper model: tiny, base, small, medium, large")
+    parser.add_argument("--model", type=str, default="base",
+                        help="Whisper model: tiny, base, small, medium, large (bigger = more accurate but slower)")
     args = parser.parse_args()
 
     if not os.path.exists(args.audio):
@@ -244,31 +297,55 @@ def main():
     print("(First time may download the model - this is normal)")
     model = whisper.load_model(args.model)
 
-    print(f"Transcribing '{args.audio}'...")
-    print("This may take a few minutes depending on the song length...")
+    print(f"Transcribing '{args.audio}' with word-level timestamps...")
+    print("This may take a few minutes...")
     result = model.transcribe(args.audio, word_timestamps=True)
 
-    print(f"\nWhisper detected {len(result['segments'])} segments")
-    print("\nAligning to lyrics...")
+    # Extract all words
+    all_words = extract_all_words(result)
+    print(f"\nWhisper detected {len(all_words)} words across {len(result['segments'])} segments")
 
-    timestamps = align_whisper_to_lyrics(result["segments"])
+    # Show what Whisper heard (for debugging)
+    print("\n--- What Whisper heard (first 200 words) ---")
+    preview = " ".join(w["raw"] for w in all_words[:200])
+    print(preview)
+    print("---\n")
 
-    # Save timestamps
+    print("Aligning lyrics to detected words...")
+    timestamps = align_lyrics_to_words(all_words)
+
+    # Save
     with open(args.output, "w") as f:
         json.dump(timestamps, f, indent=2)
 
+    matched = sum(1 for t in timestamps if t["confidence"] > 0)
+    interpolated = sum(1 for t in timestamps if t.get("interpolated"))
+    total = len(timestamps)
+
+    print(f"\nResults:")
+    print(f"  Matched:      {matched} / {total} lines")
+    print(f"  Interpolated: {interpolated} lines (estimated timing)")
+    print(f"  Total:        {total} lines")
+
+    # Show timeline
+    print(f"\n--- Sync Timeline ---")
+    current_section = None
+    for ts in timestamps:
+        if ts["section"] != current_section:
+            current_section = ts["section"]
+            print(f"\n  [{current_section}]")
+        marker = "*" if ts.get("interpolated") else " "
+        conf = f"{ts['confidence']:.0%}" if ts["confidence"] > 0 else "est."
+        print(f"  {marker} {ts['start']:6.1f}s - {ts['end']:6.1f}s  ({conf:>4})  {ts['text']}")
+
     print(f"\nTimestamps saved to: {args.output}")
-    print(f"\nMatched {sum(1 for t in timestamps if t['confidence'] > 0)} / {len(timestamps)} lines")
 
-    # Show results
-    unmatched = [t for t in timestamps if t["confidence"] == 0]
-    if unmatched:
-        print(f"\n{len(unmatched)} lines need manual timing:")
-        for t in unmatched:
-            print(f"  - \"{t['text']}\"")
+    if interpolated > 0:
+        print(f"\nLines marked with * have estimated timing.")
+        print(f"You can edit {args.output} to adjust start/end times (in seconds).")
+        print(f"Tip: Use --model medium or --model small for better accuracy.")
 
-    print(f"\nYou can now edit {args.output} to fine-tune any timing.")
-    print("Then run:")
+    print(f"\nNext step:")
     print(f'  python3 generate_video_synced.py --audio "{args.audio}"')
 
 

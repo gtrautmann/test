@@ -351,52 +351,55 @@ def render_frame(frame_num, timestamps, audio_duration, title_font, section_font
         draw.text(((WIDTH - tw) // 2, HEIGHT // 2 - 40), text, fill=color, font=title_font)
         return img
 
-    # --- Find active and recent lines ---
-    # A line is "active" (currently being sung) if current_time is between start and end
-    # A line is "recent" if it ended within the last few seconds
-    active_line_idx = None
-    visible_lines = []
-
+    # --- Find the currently active line index ---
+    active_idx = None
     for i, ts in enumerate(timestamps):
         start = ts["start"]
         end = ts.get("end", start + 2.0)
+        if start <= current_time <= end + 0.5:
+            active_idx = i
+    # If between lines, show the most recent one as active
+    if active_idx is None:
+        for i, ts in enumerate(timestamps):
+            if ts["start"] <= current_time:
+                active_idx = i
+            else:
+                break
 
-        if current_time >= start - 0.3:  # slight anticipation
-            elapsed_since_start = current_time - start
-            elapsed_since_end = current_time - end
+    if active_idx is None:
+        active_idx = 0
 
-            # Fade in: 0 to 1 over 0.4 seconds
-            fade_in = min(1.0, max(0, elapsed_since_start / 0.4))
+    # --- Build visible window: 3 past lines, active line, 3 upcoming lines ---
+    LINES_BEFORE = 3
+    LINES_AFTER = 3
+    window_start = max(0, active_idx - LINES_BEFORE)
+    window_end = min(len(timestamps), active_idx + LINES_AFTER + 1)
+    visible_lines = []
 
-            # Determine if this line is currently being sung
-            is_active = start <= current_time <= end + 0.5
+    for i in range(window_start, window_end):
+        ts = timestamps[i]
+        start = ts["start"]
+        end = ts.get("end", start + 2.0)
+        is_active = (i == active_idx) and (current_time >= start - 0.3)
+        is_past = current_time > end + 0.5
+        is_upcoming = current_time < start - 0.3
 
-            # Fade out old lines gradually
-            if elapsed_since_end > 8.0:
-                continue  # too old, don't show
-
-            if is_active:
-                active_line_idx = len(visible_lines)
-
-            visible_lines.append({
-                **ts,
-                "fade": fade_in,
-                "is_active": is_active,
-                "age": max(0, elapsed_since_end),
-                "idx": i,
-            })
-
-    # Keep last ~8 visible lines
-    if len(visible_lines) > 8:
-        # Make sure active line is included
-        if active_line_idx is not None and active_line_idx < len(visible_lines) - 8:
-            visible_lines = visible_lines[active_line_idx:active_line_idx + 8]
-            active_line_idx = 0
+        # Fade: past and active lines are fully visible, upcoming lines are dim
+        if is_upcoming:
+            fade = 0.25
+        elif is_active:
+            fade = min(1.0, max(0.3, (current_time - start + 0.3) / 0.4))
         else:
-            offset = len(visible_lines) - 8
-            visible_lines = visible_lines[-8:]
-            if active_line_idx is not None:
-                active_line_idx -= offset
+            fade = 1.0
+
+        visible_lines.append({
+            **ts,
+            "fade": fade,
+            "is_active": is_active,
+            "is_past": is_past,
+            "is_upcoming": is_upcoming,
+            "idx": i,
+        })
 
     # --- Draw visual effects for the active line ---
     for vl in visible_lines:
@@ -407,57 +410,58 @@ def render_frame(frame_num, timestamps, audio_duration, title_font, section_font
             break
 
     # --- Draw section badge ---
-    current_section = None
-    for vl in reversed(visible_lines):
-        current_section = vl["section"]
-        break
+    current_section = timestamps[active_idx]["section"]
+    badge_text = current_section.upper()
+    badge_color = get_section_color(current_section)
+    bbox = draw.textbbox((0, 0), badge_text, font=section_font)
+    tw = bbox[2] - bbox[0]
+    draw.text(((WIDTH - tw) // 2, 60), badge_text, fill=badge_color, font=section_font)
 
-    if current_section:
-        badge_text = current_section.upper()
-        badge_color = get_section_color(current_section)
-        bbox = draw.textbbox((0, 0), badge_text, font=section_font)
-        tw = bbox[2] - bbox[0]
-        draw.text(((WIDTH - tw) // 2, 60), badge_text, fill=badge_color, font=section_font)
-
-    # --- Draw lyrics ---
-    line_height = 68
+    # --- Draw lyrics with active line centered ---
+    line_height = 72
     total_height = len(visible_lines) * line_height
-    start_y = (HEIGHT - total_height) // 2 + 20
+
+    # Find position of active line in the visible list
+    active_pos_in_list = 0
+    for i, vl in enumerate(visible_lines):
+        if vl["is_active"]:
+            active_pos_in_list = i
+            break
+
+    # Center the active line vertically
+    center_y = HEIGHT // 2
+    start_y = center_y - active_pos_in_list * line_height - line_height // 2
 
     for i, vl in enumerate(visible_lines):
         y = start_y + i * line_height
         fade = vl["fade"]
         is_active = vl["is_active"]
-        age = vl["age"]
-
-        if is_active:
-            # ACTIVE LINE: bright, highlighted, section color
-            color = tuple(int(c * fade) for c in vl["color"])
-            # Glow background behind active line
-            text = vl["text"]
-            bbox = draw.textbbox((0, 0), text, font=line_font)
-            tw = bbox[2] - bbox[0]
-            x = (WIDTH - tw) // 2
-            gc = vl["color"]
-            glow_color = (gc[0] // 5, gc[1] // 5, gc[2] // 5)
-            draw.rounded_rectangle(
-                [x - 25, y - 8, x + tw + 25, y + 52],
-                radius=12, fill=glow_color
-            )
-        else:
-            # Past line: dimmer based on age
-            dim = max(0.2, 1.0 - age * 0.08)
-            base = (160, 165, 180)
-            color = tuple(int(c * dim * fade) for c in base)
 
         text = vl["text"]
         bbox = draw.textbbox((0, 0), text, font=line_font)
         tw = bbox[2] - bbox[0]
         x = (WIDTH - tw) // 2
 
-        # Slide up effect on entry
-        offset_y = int((1.0 - fade) * 15)
-        draw.text((x, y + offset_y), text, fill=color, font=line_font)
+        if is_active:
+            # ACTIVE LINE: bright section color with glow background
+            color = tuple(int(c * fade) for c in vl["color"])
+            gc = vl["color"]
+            glow_color = (gc[0] // 4, gc[1] // 4, gc[2] // 4)
+            draw.rounded_rectangle(
+                [x - 30, y - 10, x + tw + 30, y + 55],
+                radius=14, fill=glow_color
+            )
+            draw.text((x, y), text, fill=color, font=line_font)
+        elif vl["is_past"]:
+            # Past lines: visible but dimmed
+            age_factor = max(0.25, 1.0 - (active_idx - vl["idx"]) * 0.2)
+            base = (150, 155, 170)
+            color = tuple(int(c * age_factor) for c in base)
+            draw.text((x, y), text, fill=color, font=line_font)
+        else:
+            # Upcoming lines: dim, waiting
+            color = (50, 52, 65)
+            draw.text((x, y), text, fill=color, font=line_font)
 
     # Footer
     footer = "I Will Stand in the Light"
