@@ -76,6 +76,12 @@ Gradle wrapper is **not yet committed** — generate it once with a local Gradle
 - Commit focused, descriptive changes; never `--no-verify` without user approval.
 - Do **not** open PRs automatically — wait for explicit user request.
 
+## CI / APK Distribution
+
+- `.github/workflows/build-apk.yml` builds a debug APK on every push to `main` or `claude/**`, on PRs, and on manual dispatch.
+- The workflow generates the Gradle wrapper on the fly if it isn't committed.
+- Download the APK from the run's **Artifacts → `code-designer-debug-apk`** and sideload to a device (requires "Install unknown apps" permission for the installer).
+
 ## Known Gaps / Next Steps
 
 - No Gradle wrapper committed yet.
